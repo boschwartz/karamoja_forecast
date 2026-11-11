@@ -1,0 +1,49 @@
+name: Karamoja Daily IFS Trigger Check
+
+on:
+  schedule:
+    # Runs daily at 07:35 UTC (08:35 CET in winter / 09:35 CEST in summer)
+    - cron: "35 7 * * *"
+  workflow_dispatch:
+    inputs:
+      send_test_item:
+        description: "Publish a test RSS item even if no district triggered?"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  forecast-check:
+    runs-on: ubuntu-latest
+    container:
+      image: rocker/geospatial:4.4
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install remaining R packages
+        run: install2.r --error --skipinstalled httr2 patchwork
+
+      - name: Run forecast & generate RSS status feed
+        env:
+          SEND_TEST_ITEM: ${{ inputs.send_test_item }}
+          GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PAGES_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+        run: Rscript wf_ifs_hres_karamoja.R
+
+      - name: Archive high-res PNG in GitHub Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: karamoja-dashboard-${{ github.run_number }}
+          path: karamoja_ifs_hres_trigger_dashboard.png
+          retention-days: 30
+
+      - name: Publish RSS feed & map to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./public
