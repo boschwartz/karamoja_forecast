@@ -33,7 +33,7 @@ jobs:
           SEND_TEST_ITEM: ${{ inputs.send_test_item }}
           GITHUB_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           PAGES_BASE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
-        run: Rscript wf_ifs_hres_karamoja.R
+        run: Rscript wf_ifs_hres_karamoja.r
 
       - name: Archive high-res PNG in GitHub Actions
         uses: actions/upload-artifact@v4
