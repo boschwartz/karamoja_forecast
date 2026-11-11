@@ -55,7 +55,7 @@ districts_sf <- uga_adm2 |>
   ) |>
   filter(toupper(clean_name) %in% toupper(target_districts)) |>
   group_by(district) |>
-  summarise(geometry = st_union(geometry), .groups = "drop")
+  summarise(.groups = "drop")
 
 cat("Matched districts:", paste(districts_sf$district, collapse = ", "), "\n")
 
