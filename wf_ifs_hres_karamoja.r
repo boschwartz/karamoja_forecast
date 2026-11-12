@@ -101,29 +101,35 @@ country_borders_sf <- bind_rows(
 cat("Matched project areas:", paste(areas_sf$card_title, collapse = ", "), "\n")
 
 # ==============================================================================
-# 2. Build ~9 km (0.08 deg) Query Grid Over the 5-Area Bounding Box
+# 2. Build Native ~9 km (0.09 deg) Query Grid (Trimmed to 5 Areas + 15km Halo)
 # ==============================================================================
-bbox <- st_bbox(areas_sf)
-#Slightly wider East/West padding so exterior labels fit comfortably inside map frame
+bbox    <- st_bbox(areas_sf)
 pad_lat <- 0.22
 pad_lon <- 0.35
 
-grid <- expand.grid(
+full_grid <- expand.grid(
   lat = round(seq(floor((bbox["ymin"] - pad_lat) * 10) / 10,
                   ceiling((bbox["ymax"] + pad_lat) * 10) / 10,
-                  by = 0.08), 4),
+                  by = 0.09), 4),
   lon = round(seq(floor((bbox["xmin"] - pad_lon) * 10) / 10,
                   ceiling((bbox["xmax"] + pad_lon) * 10) / 10,
-                  by = 0.08), 4)
-) |>
+                  by = 0.09), 4)
+)
+
+# Only query points within 15 km of the 5 project areas (cuts API quota by ~50%)
+sf_use_s2(FALSE)
+mask_poly <- st_buffer(st_union(areas_sf), dist = 0.14) # ~15 km in degrees
+sf_use_s2(TRUE)
+
+grid_sf <- st_as_sf(full_grid, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+grid    <- full_grid[st_intersects(grid_sf, mask_poly, sparse = FALSE)[, 1], ] |>
   mutate(pt_id = row_number())
 
-cat("Total ~9km grid points to query:", nrow(grid), "\n")
+cat("Trimmed ~9km grid points to query:", nrow(grid), "\n")
 
-batch_size   <- 100
+batch_size   <- 60
 grid_batches <- split(grid, ceiling(seq_len(nrow(grid)) / batch_size))
 cat("Created", length(grid_batches), "batches.\n")
-
 # ==============================================================================
 # 3. Query Open-Meteo Forecast API (ECMWF IFS HRES 9km Daily Totals)
 # ==============================================================================
@@ -133,6 +139,7 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
   cat(sprintf("Fetching batch %s of %s...\n", batch_idx, total_batches))
   
   req <- request(base_url) |>
+    req_headers(`User-Agent` = "Karamoja-Turkana-Trigger-Monitor/1.0 (github-actions)") |>
     req_url_query(
       latitude      = paste(batch_df$lat, collapse = ","),
       longitude     = paste(batch_df$lon, collapse = ","),
@@ -142,8 +149,8 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
       forecast_days = 9                  # Guarantees Tomorrow (Day +1) through Day +7
     ) |>
     req_retry(
-      max_tries    = 5,
-      backoff      = ~ .x * 4,
+      max_tries    = 6,
+      backoff      = ~ .x * 10 + runif(1, 0, 3),
       is_transient = function(resp) resp_status(resp) %in% c(429, 500, 502, 503, 504)
     )
   
@@ -154,7 +161,7 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
     raw_data <- list(raw_data)
   }
   
-  Sys.sleep(1.2)
+  Sys.sleep(2.5)
   
   map2_dfr(raw_data, seq_len(nrow(batch_df)), function(loc, idx) {
     tibble(
@@ -175,11 +182,15 @@ daily_raw <- imap_dfr(grid_batches, ~ fetch_batch(.x, .y, length(grid_batches)))
 # ==============================================================================
 # 4. Compute Tomorrow (Day +1) & 7-Day Accumulations + Area Trigger Metrics
 # ==============================================================================
-cutoff_tom_mm    <- 19.99
-cutoff_7d_mm     <- 49.99
-display_tom_mm   <- 20
-display_7d_mm    <- 50
-trigger_quantile <- 0.90   # Spatial P90 (top 10% of area grid cells)
+thresh_tom_mm      <- 20.0   # Red trigger: >= 20.0 mm
+orange_tom_mm      <- 15.0   # Orange card: > 15.0 mm
+yellow_tom_mm      <- 10.0   # Yellow card: > 10.0 mm
+
+thresh_7d_mm       <- 50.0   # Red trigger: >= 50.0 mm
+orange_7d_mm       <- 37.0   # Orange card: > 37.0 mm
+yellow_7d_mm       <- 25.0   # Yellow card: > 25.0 mm
+
+trigger_quantile   <- 0.90   # Spatial P90 (top 10% of area grid cells)
 
 now_eat         <- as.POSIXct(format(Sys.time(), tz = "Africa/Kampala", usetz = FALSE),
                               tz = "Africa/Kampala")
@@ -215,13 +226,13 @@ grid_summary <- daily_dedup |>
   ) |>
   mutate(cell_id = row_number())
 
-# Smoothly interpolate across the cross-border bounding box (0.08 deg -> 0.015 deg)
+# Smoothly interpolate across the cross-border bounding box (0.09 deg -> 0.015 deg)
 smooth_field <- function(df, field_col, breaks, labels) {
   pts_vect <- vect(df, geom = c("ifs_lon", "ifs_lat"), crs = "EPSG:4326")
   r_coarse <- rast(
-    ext(min(df$ifs_lon) - 0.04, max(df$ifs_lon) + 0.04,
-        min(df$ifs_lat) - 0.04, max(df$ifs_lat) + 0.04),
-    resolution = 0.08,
+    ext(min(df$ifs_lon) - 0.045, max(df$ifs_lon) + 0.045,
+        min(df$ifs_lat) - 0.045, max(df$ifs_lat) + 0.045),
+    resolution = 0.09,
     crs = "EPSG:4326"
   )
   r_binned <- rasterize(pts_vect, r_coarse, field = field_col, fun = "mean")
@@ -242,7 +253,7 @@ smooth_field <- function(df, field_col, breaks, labels) {
     )
 }
 
-# Shared rainfall scale for BOTH maps
+# Shared rainfall scale for BOTH maps (both 20 mm and 50 mm sit on exact bin breaks)
 precip_breaks <- c(0, 2, 5, 10, 20, 35, 50, 75, 100, 150, Inf)
 precip_labels <- c("0 – 2", "2 – 5", "5 – 10", "10 – 20", "20 – 35",
                    "35 – 50", "50 – 75", "75 – 100", "100 – 150", "> 150")
@@ -262,16 +273,17 @@ area_stats <- map_dfr(seq_len(nrow(areas_sf)), function(i) {
   
   sub_cells <- grid_summary |> filter(cell_id %in% inside_ids)
   
-  p90_tom  <- unname(quantile(sub_cells$rain_tom_mm, probs = trigger_quantile, na.rm = TRUE))
+  # Round P90 to 1 decimal place BEFORE evaluating thresholds so colors & badges match printed values
+  p90_tom  <- round(unname(quantile(sub_cells$rain_tom_mm, probs = trigger_quantile, na.rm = TRUE)), 1)
   mean_tom <- mean(sub_cells$rain_tom_mm, na.rm = TRUE)
   max_tom  <- max(sub_cells$rain_tom_mm, na.rm = TRUE)
   
-  p90_7d   <- unname(quantile(sub_cells$rain_7d_mm, probs = trigger_quantile, na.rm = TRUE))
+  p90_7d   <- round(unname(quantile(sub_cells$rain_7d_mm, probs = trigger_quantile, na.rm = TRUE)), 1)
   mean_7d  <- mean(sub_cells$rain_7d_mm, na.rm = TRUE)
   max_7d   <- max(sub_cells$rain_7d_mm, na.rm = TRUE)
   
-  hit_tom <- p90_tom > cutoff_tom_mm
-  hit_7d  <- p90_7d  > cutoff_7d_mm
+  hit_tom <- p90_tom >= thresh_tom_mm
+  hit_7d  <- p90_7d  >= thresh_7d_mm
   
   tibble(
     area_name  = poly_sf$area_name,
@@ -293,10 +305,10 @@ area_stats <- map_dfr(seq_len(nrow(areas_sf)), function(i) {
 print(area_stats)
 
 # ==============================================================================
-# 5. Build Two-Section Cross-Border Dashboard (Clean Borders + Outside Callouts)
+# 5. Build Two-Section Cross-Border Dashboard (Traffic-Light Cards + Clean Maps)
 # ==============================================================================
-map_xlim <- c(min(df_map_7d$lon), max(df_map_7d$lon))
-map_ylim <- c(min(df_map_7d$lat), max(df_map_7d$lat))
+map_xlim <- c(unname(bbox["xmin"]) - pad_lon, unname(bbox["xmax"]) + pad_lon)
+map_ylim <- c(unname(bbox["ymin"]) - pad_lat, unname(bbox["ymax"]) + pad_lat)
 
 # Exterior label positions + pointer line targets (keeps 100% of area interiors clear)
 callout_df <- tribble(
@@ -310,7 +322,7 @@ callout_df <- tribble(
 
 build_precip_map <- function(df_raster, map_title, map_sub) {
   ggplot() +
-    # show.legend = TRUE forces ggplot2 >= 3.5 to draw ALL discrete colour swatches
+    # show.legend = TRUE forces ggplot2 >= 3.5 to draw ALL 10 discrete colour swatches
     geom_raster(
       data        = df_raster,
       aes(x = lon, y = lat, fill = precip_cat),
@@ -384,7 +396,7 @@ build_cards_panel <- function(cards_df, header_rule_text) {
     geom_rect(
       aes(xmin = 0, xmax = 1, ymin = ymin, ymax = ymax,
           fill = card_bg, colour = border_col),
-      linewidth = 0.7
+      linewidth = 0.75
     ) +
     geom_text(
       aes(x = 0.03, y = ymax - 0.020, label = card_title),
@@ -404,7 +416,7 @@ build_cards_panel <- function(cards_df, header_rule_text) {
     geom_text(
       aes(x = 0.03, y = ymax - 0.118, label = secondary_line),
       hjust = 0, vjust = 1, family = "mono",
-      size = 2.85, colour = "#475569"
+      size = 2.85, colour = "#334155"
     ) +
     scale_fill_identity() +
     scale_colour_identity() +
@@ -412,7 +424,7 @@ build_cards_panel <- function(cards_df, header_rule_text) {
     theme_void()
 }
 
-# --- Row 1: Tomorrow (Day +1) Map + 5 Area Cards ---
+# --- Row 1: Tomorrow (Day +1) Map + 5 Area Cards (Red >=20, Orange >15, Yellow >10) ---
 p_map_tom <- build_precip_map(
   df_raster = df_map_tom,
   map_title = "Immediate Forecast: Tomorrow (Day +1)",
@@ -421,27 +433,47 @@ p_map_tom <- build_precip_map(
 
 cards_tom_df <- area_stats |>
   mutate(
-    idx            = row_number(),
-    ymax           = 1 - (idx - 1) * 0.198,
-    ymin           = ymax - 0.176,
-    badge_lbl      = if_else(hit_tom, "TOMORROW TRIGGERED", "BELOW 20 MM"),
-    badge_bg       = if_else(hit_tom, "#DC2626", "#E2E8F0"),
-    badge_fg       = if_else(hit_tom, "white", "#334155"),
-    border_col     = if_else(hit_tom, "#DC2626", "#CBD5E1"),
-    card_bg        = if_else(hit_tom, "#FEF2F2", "#F8FAFC"),
-    primary_line   = sprintf("Tomorrow P90 (10%% area): %5.1f mm  [Trigger >= %d mm]",
-                             p90_tom, display_tom_mm),
+    idx        = row_number(),
+    ymax       = 1 - (idx - 1) * 0.198,
+    ymin       = ymax - 0.176,
+    badge_lbl  = if_else(hit_tom, "TOMORROW TRIGGERED", "BELOW 20 MM"),
+    card_bg    = case_when(
+      hit_tom                 ~ "#FEF2F2",  # Red
+      p90_tom > orange_tom_mm ~ "#FFF7ED",  # Orange (> 15 mm)
+      p90_tom > yellow_tom_mm ~ "#FEFCE8",  # Yellow (> 10 mm)
+      TRUE                    ~ "#F8FAFC"   # Neutral grey
+    ),
+    border_col = case_when(
+      hit_tom                 ~ "#DC2626",  # Red border
+      p90_tom > orange_tom_mm ~ "#EA580C",  # Orange border
+      p90_tom > yellow_tom_mm ~ "#CA8A04",  # Yellow-amber border
+      TRUE                    ~ "#CBD5E1"
+    ),
+    badge_bg   = case_when(
+      hit_tom                 ~ "#DC2626",
+      p90_tom > orange_tom_mm ~ "#F97316",
+      p90_tom > yellow_tom_mm ~ "#FDE047",
+      TRUE                    ~ "#E2E8F0"
+    ),
+    badge_fg   = case_when(
+      hit_tom                 ~ "white",
+      p90_tom > orange_tom_mm ~ "white",
+      p90_tom > yellow_tom_mm ~ "#1E293B",
+      TRUE                    ~ "#334155"
+    ),
+    primary_line   = sprintf("Tomorrow P90 (10%% area): %5.1f mm  [Trigger >= %.0f mm]",
+                             p90_tom, thresh_tom_mm),
     secondary_line = sprintf("Area Mean: %4.1f mm   |   Peak 9km Cell: %5.1f mm (%d cells)",
                              mean_tom, max_tom, n_cells)
   )
 
 p_cards_tom <- build_cards_panel(
   cards_tom_df,
-  sprintf("Immediate Trigger Rule: Spatial P90 > %.2f mm (>= %d mm) Tomorrow (%s)",
-          cutoff_tom_mm, display_tom_mm, format(tomorrow_date, "%d %b"))
+  sprintf("Immediate Trigger Rule: Spatial P90 >= %.1f mm Tomorrow (%s)",
+          thresh_tom_mm, format(tomorrow_date, "%d %b"))
 )
 
-# --- Row 2: 7-Day Cumulative Map + 5 Area Cards ---
+# --- Row 2: 7-Day Cumulative Map + 5 Area Cards (Red >=50, Orange >37, Yellow >25) ---
 p_map_7d <- build_precip_map(
   df_raster = df_map_7d,
   map_title = "7-Day Outlook: Tomorrow – Day +7",
@@ -450,24 +482,44 @@ p_map_7d <- build_precip_map(
 
 cards_7d_df <- area_stats |>
   mutate(
-    idx            = row_number(),
-    ymax           = 1 - (idx - 1) * 0.198,
-    ymin           = ymax - 0.176,
-    badge_lbl      = if_else(hit_7d, "7-DAY TRIGGERED", "BELOW 50 MM"),
-    badge_bg       = if_else(hit_7d, "#DC2626", "#E2E8F0"),
-    badge_fg       = if_else(hit_7d, "white", "#334155"),
-    border_col     = if_else(hit_7d, "#DC2626", "#CBD5E1"),
-    card_bg        = if_else(hit_7d, "#FEF2F2", "#F8FAFC"),
-    primary_line   = sprintf("7-Day P90 (10%% area):    %5.1f mm  [Trigger >= %d mm]",
-                             p90_7d, display_7d_mm),
+    idx        = row_number(),
+    ymax       = 1 - (idx - 1) * 0.198,
+    ymin       = ymax - 0.176,
+    badge_lbl  = if_else(hit_7d, "7-DAY TRIGGERED", "BELOW 50 MM"),
+    card_bg    = case_when(
+      hit_7d                 ~ "#FEF2F2",  # Red
+      p90_7d > orange_7d_mm  ~ "#FFF7ED",  # Orange (> 37 mm)
+      p90_7d > yellow_7d_mm  ~ "#FEFCE8",  # Yellow (> 25 mm)
+      TRUE                   ~ "#F8FAFC"   # Neutral grey
+    ),
+    border_col = case_when(
+      hit_7d                 ~ "#DC2626",  # Red border
+      p90_7d > orange_7d_mm  ~ "#EA580C",  # Orange border
+      p90_7d > yellow_7d_mm  ~ "#CA8A04",  # Yellow-amber border
+      TRUE                   ~ "#CBD5E1"
+    ),
+    badge_bg   = case_when(
+      hit_7d                 ~ "#DC2626",
+      p90_7d > orange_7d_mm  ~ "#F97316",
+      p90_7d > yellow_7d_mm  ~ "#FDE047",
+      TRUE                   ~ "#E2E8F0"
+    ),
+    badge_fg   = case_when(
+      hit_7d                 ~ "white",
+      p90_7d > orange_7d_mm  ~ "white",
+      p90_7d > yellow_7d_mm  ~ "#1E293B",
+      TRUE                   ~ "#334155"
+    ),
+    primary_line   = sprintf("7-Day P90 (10%% area):    %5.1f mm  [Trigger >= %.0f mm]",
+                             p90_7d, thresh_7d_mm),
     secondary_line = sprintf("Area Mean: %4.1f mm   |   Peak 9km Cell: %5.1f mm (%d cells)",
                              mean_7d, max_7d, n_cells)
   )
 
 p_cards_7d <- build_cards_panel(
   cards_7d_df,
-  sprintf("7-Day Trigger Rule: Spatial P90 > %.2f mm (>= %d mm, Tomorrow through Day +7)",
-          cutoff_7d_mm, display_7d_mm)
+  sprintf("7-Day Trigger Rule: Spatial P90 >= %.1f mm (Tomorrow through Day +7)",
+          thresh_7d_mm)
 )
 
 # ==============================================================================
