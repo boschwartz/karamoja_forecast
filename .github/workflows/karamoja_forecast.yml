@@ -2,12 +2,12 @@ name: Karamoja Daily IFS Trigger Check
 
 on:
   schedule:
-    # Runs daily at 07:35 UTC (08:35 CET in winter / 09:35 CEST in summer)
-    - cron: "35 7 * * *"
+    # Runs daily at 06:17 UTC (07:17 CET in winter / 08:17 CEST in summer)
+    - cron: '17 6 * * *'
   workflow_dispatch:
     inputs:
       send_test_item:
-        description: "Publish a test RSS item even if no district triggered?"
+        description: "Publish a test RSS item even if no area triggered?"
         required: false
         default: false
         type: boolean
