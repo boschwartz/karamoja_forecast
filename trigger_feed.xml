@@ -2,13 +2,6 @@
 <rss version="2.0"><channel>
   <title>Karamoja-Turkana IFS HRES Trigger Monitor</title>
   <link>https://boschwartz.github.io/karamoja_forecast/</link>
-  <description>Daily ECMWF IFS HRES trigger alerts for Uganda (Moroto, Napak, Amudat) &amp; Kenya (Turkana, West Pokot)</description>
-  <item>
-    <guid isPermaLink="false">karamoja-turkana-test-1794562720</guid>
-    <pubDate>Fri, 13 Nov 2026 09:38:40 GMT</pubDate>
-    <title>TEST CHECK - No Areas Triggered (Forecast for 14 Nov)</title>
-    <link>https://boschwartz.github.io/karamoja_forecast/</link>
-    <description>Moroto (UG): Below triggers | Tomorrow (14 Nov) P90 = 5.1 mm (Mean 2.5) | 7d P90 = 10.4 mm (Mean 5.4) &#10; Napak (UG): Below triggers | Tomorrow (14 Nov) P90 = 11.1 mm (Mean 6.4) | 7d P90 = 17.2 mm (Mean 9.7) &#10; Amudat (UG): Below triggers | Tomorrow (14 Nov) P90 = 7.6 mm (Mean 4.8) | 7d P90 = 13.1 mm (Mean 8.0) &#10; Turkana (KE): Below triggers | Tomorrow (14 Nov) P90 = 12.2 mm (Mean 5.1) | 7d P90 = 18.0 mm (Mean 8.9) &#10; West Pokot (KE): Below triggers | Tomorrow (14 Nov) P90 = 10.3 mm (Mean 5.9) | 7d P90 = 22.6 mm (Mean 14.5)</description>
-  </item>
+  <description>No active triggers today</description>
 </channel></rss>
 
