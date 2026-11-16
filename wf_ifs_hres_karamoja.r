@@ -139,19 +139,25 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
   cat(sprintf("Fetching batch %s of %s...\n", batch_idx, total_batches))
   
   req <- request(base_url) |>
-    req_headers(`User-Agent` = "Karamoja-Turkana-Trigger-Monitor/1.0 (github-actions)") |>
+    req_headers(`User-Agent` = "East-Africa-Trigger-Monitor/1.0 (github-actions)") |>
     req_url_query(
       latitude      = paste(batch_df$lat, collapse = ","),
       longitude     = paste(batch_df$lon, collapse = ","),
       daily         = "precipitation_sum",
       models        = "ecmwf_ifs",
-      timezone      = "Africa/Kampala",  # UTC+3 (identical to Africa/Nairobi)
-      forecast_days = 9                  # Guarantees Tomorrow (Day +1) through Day +7
+      timezone      = "Africa/Nairobi",  # UTC+3 (identical to Africa/Kampala)
+      forecast_days = 9
     ) |>
+    req_options(
+      connecttimeout = 30,  # Raise SSL handshake limit from 10s default to 30s
+      ipresolve      = 1L   # Force IPv4 to avoid Docker IPv6 stalls on GitHub
+    ) |>
+    req_timeout(seconds = 60) |>
     req_retry(
-      max_tries    = 6,
-      backoff      = ~ .x * 10 + runif(1, 0, 3),
-      is_transient = function(resp) resp_status(resp) %in% c(429, 500, 502, 503, 504)
+      max_tries        = 6,
+      retry_on_failure = TRUE,  # Retry low-level curl / SSL timeouts too!
+      backoff          = ~ .x * 10 + runif(1, 0, 3),
+      is_transient     = function(resp) resp_status(resp) %in% c(429, 500, 502, 503, 504)
     )
   
   resp <- req_perform(req)
