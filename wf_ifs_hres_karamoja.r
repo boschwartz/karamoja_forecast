@@ -9,7 +9,7 @@ library(sf)
 library(patchwork)
 
 # ==============================================================================
-# 1. Load Boundaries: Uganda Districts (ADM2) + Kenya Counties (ADM1)
+# 1. Load Boundaries: Uganda Districts (ADM2) + Kenya Sub-Counties (via GADM ADM3 Wards)
 # ==============================================================================
 fetch_geoboundaries <- function(endpoints, target_names, cache_path, strip_regex) {
   if (file.exists(cache_path)) {
@@ -19,7 +19,11 @@ fetch_geoboundaries <- function(endpoints, target_names, cache_path, strip_regex
   
   for (ep in endpoints) {
     candidate <- tryCatch({
-      gb_meta <- request(ep) |> req_perform() |> resp_body_json()
+      gb_meta <- request(ep) |>
+        req_options(connecttimeout = 30, ipresolve = 1L) |>
+        req_retry(max_tries = 4, retry_on_failure = TRUE) |>
+        req_perform() |>
+        resp_body_json()
       st_read(gb_meta$gjDownloadURL, quiet = TRUE) |>
         st_make_valid() |>
         st_transform(4326)
@@ -57,33 +61,63 @@ uga_targets_sf <- uga_adm2 |>
   summarise(.groups = "drop") |>
   mutate(country = "UG", unit_type = "District")
 
-# 1B. Kenya ADM1 Counties (Turkana, West Pokot)
-ken_targets <- c("Turkana", "West Pokot")
-ken_adm1 <- fetch_geoboundaries(
-  endpoints    = c("https://www.geoboundaries.org/api/current/gbOpen/KEN/ADM1/",
-                   "https://www.geoboundaries.org/api/current/gbHumanitarian/KEN/ADM1/"),
-  target_names = ken_targets,
-  cache_path   = "ken_counties_adm1.gpkg",
-  strip_regex  = "\\s+county$"
-)
+# 1B. Kenya Sub-Counties Dissolved from GADM 4.1 Level-3 Wards (Lokiriama, Loima, Pokot North)
+ken_wards_cache <- "ken_wards_gadm41_adm3.gpkg"
 
-ken_targets_sf <- ken_adm1 |>
-  mutate(
-    clean_name = trimws(sub("\\s+county$", "", shapeName, ignore.case = TRUE)),
-    area_name  = tools::toTitleCase(tolower(clean_name))
+if (file.exists(ken_wards_cache)) {
+  cat("Loading cached Kenya ADM3 wards:", ken_wards_cache, "\n")
+  ken_adm3 <- st_read(ken_wards_cache, quiet = TRUE) |> st_make_valid() |> st_transform(4326)
+} else {
+  cat("Downloading GADM 4.1 Kenya ADM3 wards (one-time ~480 KB zip)...\n")
+  gadm_zip <- tempfile(fileext = ".zip")
+  gadm_dir <- tempfile()
+  request("https://geodata.ucdavis.edu/gadm/gadm4.1/json/gadm41_KEN_3.json.zip") |>
+    req_options(connecttimeout = 30, ipresolve = 1L) |>
+    req_timeout(seconds = 120) |>
+    req_retry(max_tries = 5, retry_on_failure = TRUE) |>
+    req_perform(path = gadm_zip)
+  unzip(gadm_zip, exdir = gadm_dir)
+  json_file <- list.files(gadm_dir, pattern = "\\.json$", full.names = TRUE)[1]
+  ken_adm3  <- st_read(json_file, quiet = TRUE) |> st_make_valid() |> st_transform(4326)
+  st_write(ken_adm3, ken_wards_cache, quiet = TRUE, delete_dsn = TRUE)
+}
+
+# Normalize ward names (removes spaces/slashes so "Lokiriama/Lorengippi" matches cleanly)
+norm_str <- function(x) tolower(gsub("[^a-z0-9]", "", x))
+
+# Exact ward -> sub-county mapping from GADM 4.1 KEN_3:
+# - Lokiriama:   Kotaruk/Lobei + Lokiriama/Lorengippi (western border half of Loima)
+# - Loima:       Loima + Turkwel (eastern half of Loima)
+# - Pokot North: Alale + Kasei + Kiwawa (add "Kapchok", "Kodich", "Suam" if full Kacheliba needed)
+lokiriama_wards   <- c("Kotaruk/Lobei", "Lokiriama/Lorengippi")
+loima_wards       <- c("Loima", "Turkwel")
+pokot_north_wards <- c("Alale", "Kasei", "Kiwawa")
+
+ken_targets_sf <- ken_adm3 |>
+  dplyr::mutate(
+    area_name = dplyr::case_when(
+      NAME_1 == "Turkana"   & NAME_2 == "Loima"     & NAME_3 %in% lokiriama_wards   ~ "Lokiriama",
+      NAME_1 == "Turkana"   & NAME_2 == "Loima"     & NAME_3 %in% loima_wards       ~ "Loima",
+      NAME_1 == "WestPokot" & NAME_2 == "Kacheliba" & NAME_3 %in% pokot_north_wards ~ "Pokot North",
+      TRUE ~ NA_character_
+    )
   ) |>
-  filter(toupper(clean_name) %in% toupper(ken_targets)) |>
-  group_by(area_name) |>
-  summarise(.groups = "drop") |>
-  mutate(country = "KE", unit_type = "County")
+  dplyr::filter(!is.na(area_name)) |>
+  dplyr::group_by(area_name) |>
+  dplyr::summarise(.groups = "drop") |>
+  dplyr::mutate(country = "KE", unit_type = "Sub-County")
 
-# Standardize geometry column name before binding Uganda + Kenya target layers
+if (nrow(ken_targets_sf) < 3) {
+  stop("Expected 3 Kenyan sub-counties, matched: ", paste(ken_targets_sf$area_name, collapse = ", "))
+}
+
+# Standardize geometry column names before combining
 st_geometry(uga_targets_sf) <- "geometry"
 st_geometry(ken_targets_sf) <- "geometry"
 st_geometry(uga_adm2)       <- "geometry"
-st_geometry(ken_adm1)       <- "geometry"
+st_geometry(ken_adm3)       <- "geometry"
 
-target_order <- c("Moroto", "Napak", "Amudat", "Turkana", "West Pokot")
+target_order <- c("Moroto", "Napak", "Amudat", "Lokiriama", "Loima", "Pokot North")
 
 areas_sf <- bind_rows(uga_targets_sf, ken_targets_sf) |>
   mutate(
@@ -92,20 +126,20 @@ areas_sf <- bind_rows(uga_targets_sf, ken_targets_sf) |>
   ) |>
   arrange(area_order)
 
-# Dissolve Uganda & Kenya national borders cleanly (plus borders("world") for SS/ET)
+# Dissolve national borders cleanly for the UG/KE international boundary
 country_borders_sf <- bind_rows(
   uga_adm2 |> summarise(.groups = "drop") |> mutate(adm0 = "UGA"),
-  ken_adm1 |> summarise(.groups = "drop") |> mutate(adm0 = "KEN")
+  ken_adm3 |> summarise(.groups = "drop") |> mutate(adm0 = "KEN")
 )
 
 cat("Matched project areas:", paste(areas_sf$card_title, collapse = ", "), "\n")
 
 # ==============================================================================
-# 2. Build Native ~9 km (0.09 deg) Query Grid (Trimmed to 5 Areas + 15km Halo)
+# 2. Build Native ~9 km (0.09 deg) Query Grid (Trimmed to 6 Areas + 15km Halo)
 # ==============================================================================
 bbox    <- st_bbox(areas_sf)
-pad_lat <- 0.22
-pad_lon <- 0.35
+pad_lat <- 0.24
+pad_lon <- 0.36
 
 full_grid <- expand.grid(
   lat = round(seq(floor((bbox["ymin"] - pad_lat) * 10) / 10,
@@ -116,9 +150,8 @@ full_grid <- expand.grid(
                   by = 0.09), 4)
 )
 
-# Only query points within 15 km of the 5 project areas (cuts API quota by ~50%)
 sf_use_s2(FALSE)
-mask_poly <- st_buffer(st_union(areas_sf), dist = 0.14) # ~15 km in degrees
+mask_poly <- st_buffer(st_union(areas_sf), dist = 0.14)
 sf_use_s2(TRUE)
 
 grid_sf <- st_as_sf(full_grid, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
@@ -130,8 +163,9 @@ cat("Trimmed ~9km grid points to query:", nrow(grid), "\n")
 batch_size   <- 60
 grid_batches <- split(grid, ceiling(seq_len(nrow(grid)) / batch_size))
 cat("Created", length(grid_batches), "batches.\n")
+
 # ==============================================================================
-# 3. Query Open-Meteo Forecast API (ECMWF IFS HRES 9km Daily Totals)
+# 3. Query Open-Meteo Forecast API (With SSL/IPv4 Timeout Fix & Local Dev Cache)
 # ==============================================================================
 base_url <- "https://api.open-meteo.com/v1/forecast"
 
@@ -139,23 +173,23 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
   cat(sprintf("Fetching batch %s of %s...\n", batch_idx, total_batches))
   
   req <- request(base_url) |>
-    req_headers(`User-Agent` = "East-Africa-Trigger-Monitor/1.0 (github-actions)") |>
+    req_headers(`User-Agent` = "Karamoja-CrossBorder-Trigger-Monitor/1.1 (github-actions)") |>
     req_url_query(
       latitude      = paste(batch_df$lat, collapse = ","),
       longitude     = paste(batch_df$lon, collapse = ","),
       daily         = "precipitation_sum",
       models        = "ecmwf_ifs",
-      timezone      = "Africa/Nairobi",  # UTC+3 (identical to Africa/Kampala)
+      timezone      = "Africa/Kampala",  # UTC+3 (identical to Africa/Nairobi)
       forecast_days = 9
     ) |>
     req_options(
-      connecttimeout = 30,  # Raise SSL handshake limit from 10s default to 30s
-      ipresolve      = 1L   # Force IPv4 to avoid Docker IPv6 stalls on GitHub
+      connecttimeout = 30,  # Prevents 10s SSL handshake abort
+      ipresolve      = 1L   # Forces IPv4 inside Docker container
     ) |>
     req_timeout(seconds = 60) |>
     req_retry(
       max_tries        = 6,
-      retry_on_failure = TRUE,  # Retry low-level curl / SSL timeouts too!
+      retry_on_failure = TRUE,
       backoff          = ~ .x * 10 + runif(1, 0, 3),
       is_transient     = function(resp) resp_status(resp) %in% c(429, 500, 502, 503, 504)
     )
@@ -167,13 +201,13 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
     raw_data <- list(raw_data)
   }
   
-  Sys.sleep(2.5)
+  Sys.sleep(2.0)
   
   map2_dfr(raw_data, seq_len(nrow(batch_df)), function(loc, idx) {
     tibble(
       pt_id     = batch_df$pt_id[idx],
-      ifs_lat   = loc$latitude,   # Native ~9km IFS cell centre
-      ifs_lon   = loc$longitude,  # Native ~9km IFS cell centre
+      ifs_lat   = loc$latitude,
+      ifs_lon   = loc$longitude,
       date      = as.Date(unlist(loc$daily$time)),
       precip_mm = map_dbl(
         loc$daily$precipitation_sum,
@@ -183,7 +217,14 @@ fetch_batch <- function(batch_df, batch_idx, total_batches) {
   })
 }
 
-daily_raw <- imap_dfr(grid_batches, ~ fetch_batch(.x, .y, length(grid_batches)))
+raw_cache <- sprintf("daily_raw_subcounties_%s.rds", Sys.Date())
+if (Sys.getenv("GITHUB_ACTIONS") != "true" && file.exists(raw_cache)) {
+  cat("Loading locally cached API response from", raw_cache, "...\n")
+  daily_raw <- readRDS(raw_cache)
+} else {
+  daily_raw <- imap_dfr(grid_batches, ~ fetch_batch(.x, .y, length(grid_batches)))
+  if (Sys.getenv("GITHUB_ACTIONS") != "true") saveRDS(daily_raw, raw_cache)
+}
 
 # ==============================================================================
 # 4. Compute Tomorrow (Day +1) & 7-Day Accumulations + Area Trigger Metrics
@@ -214,10 +255,6 @@ label_7d_window  <- sprintf("%s to %s (EAT)",
                             format(min(target_dates_7d), "%d %b %Y"),
                             format(max(target_dates_7d), "%d %b %Y"))
 
-cat("Tomorrow Window:", label_tom_window, "\n")
-cat("7-Day Window:   ", label_7d_window, "\n")
-
-# Deduplicate daily data to unique native IFS cells
 daily_dedup <- daily_raw |>
   filter(date %in% target_dates_7d) |>
   group_by(ifs_lat, ifs_lon, date) |>
@@ -232,12 +269,13 @@ grid_summary <- daily_dedup |>
   ) |>
   mutate(cell_id = row_number())
 
-# Smoothly interpolate across the cross-border bounding box (0.09 deg -> 0.015 deg)
+mask_vect <- vect(st_as_sf(mask_poly))
+
 smooth_field <- function(df, field_col, breaks, labels) {
   pts_vect <- vect(df, geom = c("ifs_lon", "ifs_lat"), crs = "EPSG:4326")
   r_coarse <- rast(
-    ext(min(df$ifs_lon) - 0.045, max(df$ifs_lon) + 0.045,
-        min(df$ifs_lat) - 0.045, max(df$ifs_lat) + 0.045),
+    ext(unname(bbox["xmin"]) - pad_lon, unname(bbox["xmax"]) + pad_lon,
+        unname(bbox["ymin"]) - pad_lat, unname(bbox["ymax"]) + pad_lat),
     resolution = 0.09,
     crs = "EPSG:4326"
   )
@@ -246,8 +284,9 @@ smooth_field <- function(df, field_col, breaks, labels) {
   r_fine   <- rast(ext(r_filled), resolution = 0.015, crs = "EPSG:4326")
   r_smooth <- resample(r_filled, r_fine, method = "bilinear")
   r_smooth[r_smooth < 0] <- 0
+  r_masked <- mask(r_smooth, mask_vect)
   
-  out_df <- as.data.frame(r_smooth, xy = TRUE, na.rm = TRUE)
+  out_df <- as.data.frame(r_masked, xy = TRUE, na.rm = TRUE)
   names(out_df) <- c("lon", "lat", "precip_mm")
   out_df |>
     mutate(
@@ -259,7 +298,6 @@ smooth_field <- function(df, field_col, breaks, labels) {
     )
 }
 
-# Shared rainfall scale for BOTH maps (both 20 mm and 50 mm sit on exact bin breaks)
 precip_breaks <- c(0, 2, 5, 10, 20, 35, 50, 75, 100, 150, Inf)
 precip_labels <- c("0 – 2", "2 – 5", "5 – 10", "10 – 20", "20 – 35",
                    "35 – 50", "50 – 75", "75 – 100", "100 – 150", "> 150")
@@ -267,7 +305,6 @@ precip_labels <- c("0 – 2", "2 – 5", "5 – 10", "10 – 20", "20 – 35",
 df_map_tom <- smooth_field(grid_summary, "rain_tom_mm", precip_breaks, precip_labels)
 df_map_7d  <- smooth_field(grid_summary, "rain_7d_mm",  precip_breaks, precip_labels)
 
-# Area-level spatial P90, Mean & Max for all 5 project areas
 cells_sf <- st_as_sf(grid_summary, coords = c("ifs_lon", "ifs_lat"), crs = 4326)
 
 area_stats <- map_dfr(seq_len(nrow(areas_sf)), function(i) {
@@ -279,7 +316,6 @@ area_stats <- map_dfr(seq_len(nrow(areas_sf)), function(i) {
   
   sub_cells <- grid_summary |> filter(cell_id %in% inside_ids)
   
-  # Round P90 to 1 decimal place BEFORE evaluating thresholds so colors & badges match printed values
   p90_tom  <- round(unname(quantile(sub_cells$rain_tom_mm, probs = trigger_quantile, na.rm = TRUE)), 1)
   mean_tom <- mean(sub_cells$rain_tom_mm, na.rm = TRUE)
   max_tom  <- max(sub_cells$rain_tom_mm, na.rm = TRUE)
@@ -311,39 +347,38 @@ area_stats <- map_dfr(seq_len(nrow(areas_sf)), function(i) {
 print(area_stats)
 
 # ==============================================================================
-# 5. Build Two-Section Cross-Border Dashboard (Traffic-Light Cards + Clean Maps)
+# 5. Build Two-Section Cross-Border Dashboard (6 Traffic-Light Cards + Callouts)
 # ==============================================================================
-map_xlim <- c(unname(bbox["xmin"]) - pad_lon, unname(bbox["xmax"]) + pad_lon)
+map_xlim <- c(unname(bbox["xmin"]) - pad_lon, unname(bbox["xmax"]) + pad_lon + 0.32)
 map_ylim <- c(unname(bbox["ymin"]) - pad_lat, unname(bbox["ymax"]) + pad_lat)
 
-# Exterior label positions + pointer line targets (keeps 100% of area interiors clear)
+# Uncrossed exterior label slots + short edge-touching pointer targets
 callout_df <- tribble(
-  ~area_name,   ~lbl_x, ~lbl_y, ~target_x, ~target_y,
-  "Moroto",      33.92,   3.18,     34.48,     2.82,   # Just NW outside Moroto
-  "Napak",       33.78,   2.28,     34.12,     2.32,   # Just West outside Napak
-  "Amudat",      34.18,   1.48,     34.78,     1.68,   # Just SW outside Amudat
-  "Turkana",     36.52,   4.55,     35.95,     4.15,   # NE across Lake Turkana
-  "West Pokot",  36.22,   1.32,     35.56,     1.48    # SE outside West Pokot
+  ~area_name,    ~lbl_x, ~lbl_y, ~target_x, ~target_y,
+  # Left side (Uganda Districts, North -> South)
+  "Moroto",       33.98,   3.22,     34.48,     2.85,
+  "Napak",        33.82,   2.30,     34.18,     2.38,
+  "Amudat",       34.15,   1.48,     34.82,     1.75,
+  # Right side (Kenya Sub-Counties, true North -> South order so lines never cross)
+  "Loima",        35.92,   3.38,     35.42,     3.25,
+  "Lokiriama",    35.95,   2.58,     35.24,     2.68,
+  "Pokot North",  35.85,   1.68,     35.32,     1.98
 )
+
 
 build_precip_map <- function(df_raster, map_title, map_sub) {
   ggplot() +
-    # show.legend = TRUE forces ggplot2 >= 3.5 to draw ALL 10 discrete colour swatches
     geom_raster(
       data        = df_raster,
       aes(x = lon, y = lat, fill = precip_cat),
       show.legend = TRUE
     ) +
-    # Surrounding international borders (South Sudan, Ethiopia, Uganda, Kenya)
-    borders("world", xlim = c(32, 39), ylim = c(0, 7),
-            colour = "grey20", linewidth = 0.45) +
-    # High-precision UG/KE international boundary dashed overlay
-    geom_sf(data = country_borders_sf, fill = NA, colour = "grey15",
+    borders("world", xlim = c(32, 38), ylim = c(0, 6),
+            colour = "grey35", linewidth = 0.45) +
+    geom_sf(data = country_borders_sf, fill = NA, colour = "grey20",
             linewidth = 0.5, linetype = "dashed") +
-    # Only the 5 project areas (white halo + crisp dark border, no subnational clutter)
     geom_sf(data = areas_sf, fill = NA, colour = "white", linewidth = 1.35) +
     geom_sf(data = areas_sf, fill = NA, colour = "#0F172A", linewidth = 0.7) +
-    # Callout pointer lines from outside labels to each polygon
     geom_segment(
       data = callout_df,
       aes(x = lbl_x, y = lbl_y, xend = target_x, yend = target_y),
@@ -364,7 +399,7 @@ build_precip_map <- function(df_raster, map_title, map_sub) {
       aes(x = lbl_x, y = lbl_y, label = area_name),
       fontface      = "bold",
       size          = 2.85,
-      fill          = alpha("white", 0.90),
+      fill          = alpha("white", 0.92),
       colour        = "#0F172A",
       label.size    = 0.25,
       label.padding = unit(0.16, "lines")
@@ -377,60 +412,62 @@ build_precip_map <- function(df_raster, map_title, map_sub) {
       drop      = FALSE
     ) +
     coord_sf(xlim = map_xlim, ylim = map_ylim, expand = FALSE) +
-    scale_x_continuous(breaks = seq(34, 37, by = 1)) +
+    scale_x_continuous(breaks = seq(34.0, 36.0, by = 0.5)) +
     labs(title = map_title, subtitle = map_sub, x = "Longitude", y = "Latitude") +
     theme_minimal(base_size = 10.5) +
     theme(
-      plot.title      = element_text(face = "bold", size = 12.5, colour = "#0F172A"),
-      plot.subtitle   = element_text(size = 9.5, colour = "grey30"),
-      panel.border    = element_rect(colour = "grey30", fill = NA, linewidth = 0.6),
-      panel.grid      = element_blank(),
-      legend.position = "right",
-      legend.title    = element_text(face = "bold", size = 9.5),
-      axis.text       = element_text(colour = "grey25", size = 8.5)
+      plot.title       = element_text(face = "bold", size = 12.5, colour = "#0F172A"),
+      plot.subtitle    = element_text(size = 9.5, colour = "grey30"),
+      panel.background = element_rect(fill = "#F8FAFC", colour = NA),
+      panel.border     = element_rect(colour = "grey30", fill = NA, linewidth = 0.6),
+      panel.grid       = element_blank(),
+      legend.position  = "right",
+      legend.title     = element_text(face = "bold", size = 9.5),
+      axis.text        = element_text(colour = "grey25", size = 8.5)
     ) +
     guides(fill = guide_legend(reverse = TRUE, override.aes = list(alpha = 1)))
 }
 
+# Compact 6-card vertical stack
 build_cards_panel <- function(cards_df, header_rule_text) {
   ggplot(cards_df) +
     annotate(
-      "text", x = 0, y = 1.025, hjust = 0, vjust = 0,
+      "text", x = 0, y = 1.022, hjust = 0, vjust = 0,
       label = header_rule_text,
-      size = 3.2, fontface = "bold", colour = "#334155"
+      size = 3.15, fontface = "bold", colour = "#334155"
     ) +
     geom_rect(
       aes(xmin = 0, xmax = 1, ymin = ymin, ymax = ymax,
           fill = card_bg, colour = border_col),
-      linewidth = 0.75
+      linewidth = 0.72
     ) +
     geom_text(
-      aes(x = 0.03, y = ymax - 0.020, label = card_title),
-      hjust = 0, vjust = 1, fontface = "bold", size = 3.65, colour = "#0F172A"
+      aes(x = 0.03, y = ymax - 0.016, label = card_title),
+      hjust = 0, vjust = 1, fontface = "bold", size = 3.45, colour = "#0F172A"
     ) +
     geom_label(
-      aes(x = 0.97, y = ymax - 0.018, label = badge_lbl,
+      aes(x = 0.97, y = ymax - 0.014, label = badge_lbl,
           fill = badge_bg, colour = badge_fg),
-      hjust = 1, vjust = 1, fontface = "bold", size = 2.55,
-      label.size = 0, label.padding = unit(0.18, "lines")
+      hjust = 1, vjust = 1, fontface = "bold", size = 2.45,
+      label.size = 0, label.padding = unit(0.16, "lines")
     ) +
     geom_text(
-      aes(x = 0.03, y = ymax - 0.072, label = primary_line),
+      aes(x = 0.03, y = ymax - 0.060, label = primary_line),
       hjust = 0, vjust = 1, family = "mono", fontface = "bold",
-      size = 3.05, colour = "#0F172A"
+      size = 2.9, colour = "#0F172A"
     ) +
     geom_text(
-      aes(x = 0.03, y = ymax - 0.118, label = secondary_line),
+      aes(x = 0.03, y = ymax - 0.101, label = secondary_line),
       hjust = 0, vjust = 1, family = "mono",
-      size = 2.85, colour = "#334155"
+      size = 2.75, colour = "#334155"
     ) +
     scale_fill_identity() +
     scale_colour_identity() +
-    coord_cartesian(xlim = c(0, 1), ylim = c(0.01, 1.07), clip = "off") +
+    coord_cartesian(xlim = c(0, 1), ylim = c(0.01, 1.065), clip = "off") +
     theme_void()
 }
 
-# --- Row 1: Tomorrow (Day +1) Map + 5 Area Cards (Red >=20, Orange >15, Yellow >10) ---
+# --- Row 1: Tomorrow (Day +1) Map + 6 Area Cards ---
 p_map_tom <- build_precip_map(
   df_raster = df_map_tom,
   map_title = "Immediate Forecast: Tomorrow (Day +1)",
@@ -440,19 +477,19 @@ p_map_tom <- build_precip_map(
 cards_tom_df <- area_stats |>
   mutate(
     idx        = row_number(),
-    ymax       = 1 - (idx - 1) * 0.198,
-    ymin       = ymax - 0.176,
+    ymax       = 1 - (idx - 1) * 0.165,
+    ymin       = ymax - 0.146,
     badge_lbl  = if_else(hit_tom, "TOMORROW TRIGGERED", "BELOW 20 MM"),
     card_bg    = case_when(
-      hit_tom                 ~ "#FEF2F2",  # Red
-      p90_tom > orange_tom_mm ~ "#FFF7ED",  # Orange (> 15 mm)
-      p90_tom > yellow_tom_mm ~ "#FEFCE8",  # Yellow (> 10 mm)
-      TRUE                    ~ "#F8FAFC"   # Neutral grey
+      hit_tom                 ~ "#FEF2F2",
+      p90_tom > orange_tom_mm ~ "#FFF7ED",
+      p90_tom > yellow_tom_mm ~ "#FEFCE8",
+      TRUE                    ~ "#F8FAFC"
     ),
     border_col = case_when(
-      hit_tom                 ~ "#DC2626",  # Red border
-      p90_tom > orange_tom_mm ~ "#EA580C",  # Orange border
-      p90_tom > yellow_tom_mm ~ "#CA8A04",  # Yellow-amber border
+      hit_tom                 ~ "#DC2626",
+      p90_tom > orange_tom_mm ~ "#EA580C",
+      p90_tom > yellow_tom_mm ~ "#CA8A04",
       TRUE                    ~ "#CBD5E1"
     ),
     badge_bg   = case_when(
@@ -479,7 +516,7 @@ p_cards_tom <- build_cards_panel(
           thresh_tom_mm, format(tomorrow_date, "%d %b"))
 )
 
-# --- Row 2: 7-Day Cumulative Map + 5 Area Cards (Red >=50, Orange >37, Yellow >25) ---
+# --- Row 2: 7-Day Cumulative Map + 6 Area Cards ---
 p_map_7d <- build_precip_map(
   df_raster = df_map_7d,
   map_title = "7-Day Outlook: Tomorrow – Day +7",
@@ -489,19 +526,19 @@ p_map_7d <- build_precip_map(
 cards_7d_df <- area_stats |>
   mutate(
     idx        = row_number(),
-    ymax       = 1 - (idx - 1) * 0.198,
-    ymin       = ymax - 0.176,
+    ymax       = 1 - (idx - 1) * 0.165,
+    ymin       = ymax - 0.146,
     badge_lbl  = if_else(hit_7d, "7-DAY TRIGGERED", "BELOW 50 MM"),
     card_bg    = case_when(
-      hit_7d                 ~ "#FEF2F2",  # Red
-      p90_7d > orange_7d_mm  ~ "#FFF7ED",  # Orange (> 37 mm)
-      p90_7d > yellow_7d_mm  ~ "#FEFCE8",  # Yellow (> 25 mm)
-      TRUE                   ~ "#F8FAFC"   # Neutral grey
+      hit_7d                 ~ "#FEF2F2",
+      p90_7d > orange_7d_mm  ~ "#FFF7ED",
+      p90_7d > yellow_7d_mm  ~ "#FEFCE8",
+      TRUE                   ~ "#F8FAFC"
     ),
     border_col = case_when(
-      hit_7d                 ~ "#DC2626",  # Red border
-      p90_7d > orange_7d_mm  ~ "#EA580C",  # Orange border
-      p90_7d > yellow_7d_mm  ~ "#CA8A04",  # Yellow-amber border
+      hit_7d                 ~ "#DC2626",
+      p90_7d > orange_7d_mm  ~ "#EA580C",
+      p90_7d > yellow_7d_mm  ~ "#CA8A04",
       TRUE                   ~ "#CBD5E1"
     ),
     badge_bg   = case_when(
@@ -536,20 +573,22 @@ row_7d  <- (p_map_7d  + p_cards_7d)  + plot_layout(widths = c(1.15, 1.35))
 
 final_plot <- (row_tom / row_7d) +
   plot_annotation(
-    title    = "ECMWF IFS HRES (9 km): Uganda–Kenya Cross-Border Precipitation Trigger Monitor",
-    subtitle = sprintf("Uganda (Moroto, Napak, Amudat) & Kenya (Turkana, West Pokot)  |  Run: %s EAT",
-                       format(now_eat, "%d %b %Y %H:%M")),
+    title    = "ECMWF IFS HRES (9 km): Karamoja–Turkana–Pokot Cross-Border Trigger Monitor",
+    subtitle = sprintf(
+      "Uganda (Moroto, Napak, Amudat) & Kenya Sub-Counties (Lokiriama, Loima, Pokot North)  |  Run: %s EAT",
+      format(now_eat, "%d %b %Y %H:%M")
+    ),
     theme    = theme(
-      plot.title    = element_text(face = "bold", size = 16, colour = "#0F172A"),
-      plot.subtitle = element_text(size = 11, colour = "grey30")
+      plot.title    = element_text(face = "bold", size = 15.5, colour = "#0F172A"),
+      plot.subtitle = element_text(size = 10.5, colour = "grey30")
     )
   )
 
 ggsave(
   filename = "karamoja_ifs_hres_trigger_dashboard.png",
   plot     = final_plot,
-  width    = 14.2,
-  height   = 15.2,
+  width    = 14.4,
+  height   = 16.0,
   dpi      = 300,
   bg       = "white"
 )
@@ -618,9 +657,9 @@ if (any_triggered || send_always) {
     paste0(
       '<?xml version="1.0" encoding="UTF-8"?>\n',
       '<rss version="2.0"><channel>\n',
-      '  <title>Karamoja-Turkana IFS HRES Trigger Monitor</title>\n',
+      '  <title>Karamoja-Turkana-Pokot IFS HRES Trigger Monitor</title>\n',
       '  <link>%s</link>\n',
-      '  <description>Daily ECMWF IFS HRES trigger alerts for Uganda (Moroto, Napak, Amudat) &amp; Kenya (Turkana, West Pokot)</description>\n',
+      '  <description>Daily ECMWF IFS HRES trigger alerts for Moroto, Napak, Amudat (UG) &amp; Lokiriama, Loima, Pokot North (KE)</description>\n',
       '  <item>\n',
       '    <guid isPermaLink="false">%s</guid>\n',
       '    <pubDate>%s</pubDate>\n',
@@ -642,7 +681,7 @@ if (any_triggered || send_always) {
     paste0(
       '<?xml version="1.0" encoding="UTF-8"?>\n',
       '<rss version="2.0"><channel>\n',
-      '  <title>Karamoja-Turkana IFS HRES Trigger Monitor</title>\n',
+      '  <title>Karamoja-Turkana-Pokot IFS HRES Trigger Monitor</title>\n',
       '  <link>%s</link>\n',
       '  <description>No active triggers today</description>\n',
       '</channel></rss>\n'
@@ -660,11 +699,11 @@ file.copy("karamoja_ifs_hres_trigger_dashboard.png",
 index_html <- sprintf(
   paste0(
     "<!DOCTYPE html><html><head><meta charset='utf-8'>",
-    "<title>Karamoja–Turkana Trigger Monitor</title>",
+    "<title>Karamoja–Turkana–Pokot Trigger Monitor</title>",
     "<style>body{font-family:sans-serif;margin:24px;background:#F8FAFC;color:#0F172A;max-width:1280px;}",
     "img{width:100%%;height:auto;border:1px solid #CBD5E1;border-radius:6px;background:white;}</style></head>",
     "<body><h2>Uganda–Kenya Cross-Border IFS HRES Trigger Dashboard</h2>",
-    "<p>Areas: Moroto, Napak, Amudat (UG) &amp; Turkana, West Pokot (KE) | ",
+    "<p>Areas: Moroto, Napak, Amudat (UG) &amp; Lokiriama, Loima, Pokot North Sub-Counties (KE) | ",
     "Last updated: %s EAT (%s UTC) | <a href='trigger_feed.xml'>RSS Trigger Feed</a></p>",
     "<img src='karamoja_ifs_hres_trigger_dashboard.png?v=%d' alt='Cross-Border Forecast Dashboard'/>",
     "</body></html>"
